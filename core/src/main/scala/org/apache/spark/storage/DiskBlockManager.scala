@@ -17,9 +17,8 @@
 
 package org.apache.spark.storage
 
-import java.io.File
-import java.text.SimpleDateFormat
-import java.util.{Date, Random, UUID}
+import java.util.UUID
+import java.io.{IOException, File}
 
 import org.apache.spark.{SparkConf, Logging}
 import org.apache.spark.executor.ExecutorExitCode
@@ -37,13 +36,16 @@ import org.apache.spark.util.Utils
 private[spark] class DiskBlockManager(blockManager: BlockManager, conf: SparkConf)
   extends Logging {
 
-  private val MAX_DIR_CREATION_ATTEMPTS: Int = 10
   private[spark]
   val subDirsPerLocalDir = blockManager.conf.getInt("spark.diskStore.subDirectories", 64)
 
   /* Create one local directory for each path mentioned in spark.local.dir; then, inside this
    * directory, create multiple subdirectories that we will hash files into, in order to avoid
    * having really large inodes at the top level. */
+  /**
+   * add by yay(598775508) at 2015/1/9-11:11
+   * 对spark.local.dir中设置的每一个path创建一个本地的目录；然后在这个目录中创建多个hash存储Block文件的子目录,目的是为了避免上级拥有大量的索引节点
+   */
   private[spark] val localDirs: Array[File] = createLocalDirs(conf)
   if (localDirs.isEmpty) {
     logError("Failed to create any local dir.")
@@ -56,13 +58,21 @@ private[spark] class DiskBlockManager(blockManager: BlockManager, conf: SparkCon
   /** Looks up a file by hashing it into one of our local subdirectories. */
   // This method should be kept in sync with
   // org.apache.spark.network.shuffle.StandaloneShuffleBlockManager#getFile().
+  /**
+   * add by yay(598775508) at 2015/1/9-11:33
+   * 在diskManager里面，每一个block都被存储为一个file，通过计算block id的hash值将block映射到文件中.
+   * block id与文件路径的映射关系如下：
+   * 根据block id计算出hash值，将hash取模获得dirId和subDirId，在subDirs中找出相应的subDir，若没有则新建一个subDir，最后以subDir为路径、block id为文件名创建file handler
+   */
   def getFile(filename: String): File = {
     // Figure out which local directory it hashes to, and which subdirectory in that
+//    filename=blockId.name
     val hash = Utils.nonNegativeHash(filename)
     val dirId = hash % localDirs.length
     val subDirId = (hash / localDirs.length) % subDirsPerLocalDir
 
     // Create the subdirectory if it doesn't already exist
+    //    如果子目录不存在则创建
     var subDir = subDirs(dirId)(subDirId)
     if (subDir == null) {
       subDir = subDirs(dirId).synchronized {
@@ -121,33 +131,15 @@ private[spark] class DiskBlockManager(blockManager: BlockManager, conf: SparkCon
   }
 
   private def createLocalDirs(conf: SparkConf): Array[File] = {
-    val dateFormat = new SimpleDateFormat("yyyyMMddHHmmss")
     Utils.getOrCreateLocalRootDirs(conf).flatMap { rootDir =>
-      var foundLocalDir = false
-      var localDir: File = null
-      var localDirId: String = null
-      var tries = 0
-      val rand = new Random()
-      while (!foundLocalDir && tries < MAX_DIR_CREATION_ATTEMPTS) {
-        tries += 1
-        try {
-          localDirId = "%s-%04x".format(dateFormat.format(new Date), rand.nextInt(65536))
-          localDir = new File(rootDir, s"spark-local-$localDirId")
-          if (!localDir.exists) {
-            foundLocalDir = localDir.mkdirs()
-          }
-        } catch {
-          case e: Exception =>
-            logWarning(s"Attempt $tries to create local dir $localDir failed", e)
-        }
-      }
-      if (!foundLocalDir) {
-        logError(s"Failed $MAX_DIR_CREATION_ATTEMPTS attempts to create local dir in $rootDir." +
-                  " Ignoring this directory.")
-        None
-      } else {
+      try {
+        val localDir = Utils.createDirectory(rootDir, "blockmgr")
         logInfo(s"Created local directory at $localDir")
         Some(localDir)
+      } catch {
+        case e: IOException =>
+          logError(s"Failed to create local dir in $rootDir. Ignoring this directory.", e)
+          None
       }
     }
   }
@@ -164,7 +156,7 @@ private[spark] class DiskBlockManager(blockManager: BlockManager, conf: SparkCon
   /** Cleanup local dirs and stop shuffle sender. */
   private[spark] def stop() {
     // Only perform cleanup if an external service is not serving our shuffle files.
-    if (!blockManager.externalShuffleServiceEnabled) {
+    if (!blockManager.externalShuffleServiceEnabled || blockManager.blockManagerId.isDriver) {
       localDirs.foreach { localDir =>
         if (localDir.isDirectory() && localDir.exists()) {
           try {

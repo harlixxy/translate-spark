@@ -50,10 +50,10 @@ import org.apache.spark.util.{AkkaUtils, Utils}
  * NOTE: This is not intended for external use. This is exposed for Shark and may be made private
  *       in a future release.
  *
- * 持有所有的运行时环境对象，并为Spark运行时实例（可能是Master或者Worker）服务
+ * 持有所有的运行时环境对象，并为Spark运行中的实例（可能是Master或者Worker）服务
  * 这些环境对象包括： 序列化对象， Akka调度系统， Block管理器，map输出跟踪器等
- * 目前的代码实现是Spark通过线程变量查询一个SparkEnv的实例，这些线程需要有对SparkEnv对象的写入的权限。
- * 访问当前环境对象，你可以使用SparkEnv.get(当然需要先创建一个SparkContext实例)进行读操作或者SparkEnv.set进行写操作
+ * 目前在Spark代码通过全局变量查找来获的SparkEnv的实例，因此所有的线程访问的其实是一个SparkEnv对象。
+ * 访问SparkEnv对象的方法是SparkEnv.get(当然需要先创建一个SparkContext实例)
  */
 @DeveloperApi
 class SparkEnv (
@@ -152,6 +152,7 @@ object SparkEnv extends Logging {
 
   /**
    * Create a SparkEnv for the driver.
+   * 创建Driver上的SparkEnv
    */
   private[spark] def createDriverEnv(
       conf: SparkConf,
@@ -161,12 +162,21 @@ object SparkEnv extends Logging {
     assert(conf.contains("spark.driver.port"), "spark.driver.port is not set on the driver!")
     val hostname = conf.get("spark.driver.host")
     val port = conf.get("spark.driver.port").toInt
-    create(conf, SparkContext.DRIVER_IDENTIFIER, hostname, port, true, isLocal, listenerBus)
+    create(
+      conf,
+      SparkContext.DRIVER_IDENTIFIER,
+      hostname,
+      port,
+      isDriver = true,
+      isLocal = isLocal,
+      listenerBus = listenerBus
+    )
   }
 
   /**
    * Create a SparkEnv for an executor.
    * In coarse-grained mode, the executor provides an actor system that is already instantiated.
+   * 创建Executor上使用的SparkEnv.
    */
   private[spark] def createExecutorEnv(
       conf: SparkConf,
@@ -176,8 +186,16 @@ object SparkEnv extends Logging {
       numCores: Int,
       isLocal: Boolean,
       actorSystem: ActorSystem = null): SparkEnv = {
-    create(conf, executorId, hostname, port, false, isLocal, defaultActorSystem = actorSystem,
-      numUsableCores = numCores)
+    create(
+      conf,
+      executorId,
+      hostname,
+      port,
+      isDriver = false,
+      isLocal = isLocal,
+      defaultActorSystem = actorSystem,
+      numUsableCores = numCores
+    )
   }
 
   /**
@@ -250,6 +268,11 @@ object SparkEnv extends Logging {
     val closureSerializer = instantiateClassFromConf[Serializer](
       "spark.closure.serializer", "org.apache.spark.serializer.JavaSerializer")
 
+    /**
+     * add by yay(598775508) at 2015/1/7-22:38
+     * 如果当前节点是driver则创建这个actor，否则建立到driver的连接。
+     * 也就是说：对于BlockManagerMaster, 在master上创建BlockManagerMasterActor, 而在slave上创建BlockManagerMasterActor的ref
+     */
     def registerOrLookup(name: String, newActor: => Actor): ActorRef = {
       if (isDriver) {
         logInfo("Registering " + name)
@@ -289,15 +312,28 @@ object SparkEnv extends Logging {
           new NioBlockTransferService(conf, securityManager)
       }
 
+    /**
+     * add by yay(598775508) at 2015/1/7-22:36
+     * BlockManagerMaster模块只运行在Driver Application所在的Executor，功能是负责记录下所有BlockIds存储在哪个SlaveWorker上，
+     * 比如RDD Task运行在机器A，所需要的BlockId为3，但在机器A上没有BlockId为3的数值，这个时候Slave worker需要通过BlockManager
+     * 向BlockManagerMaster询问数据存储的位置，然后再通过ConnectionManager去获取.
+     */
     val blockManagerMaster = new BlockManagerMaster(registerOrLookup(
       "BlockManagerMaster",
       new BlockManagerMasterActor(isLocal, conf, listenerBus)), conf, isDriver)
 
     // NB: blockManager is not valid until initialize() is called later.
+    /**
+     * add by yay(598775508) at 2015/1/8-21:44
+     * BlockManager wrap了BlockManagerMaster，通过BlockManagerMaster进行通信。
+     * Spark会在client driver和executor端创建各自的BlockManager，通过BlockManager对storage模块进行操作。
+     */
     val blockManager = new BlockManager(executorId, actorSystem, blockManagerMaster,
       serializer, conf, mapOutputTracker, shuffleManager, blockTransferService, securityManager,
       numUsableCores)
 
+//    SparkContext初始化的时候会调用createDriverEnv，从而创建一个broadcastManager
+//    构造BlockcastManager对象时会调用initialize方法，主要根据配置初始化broadcastFactory变量，并且调用其initialize方法
     val broadcastManager = new BroadcastManager(isDriver, conf, securityManager)
 
     val cacheManager = new CacheManager(blockManager)
@@ -305,7 +341,7 @@ object SparkEnv extends Logging {
     val httpFileServer =
       if (isDriver) {
         val fileServerPort = conf.getInt("spark.fileserver.port", 0)
-        val server = new HttpFileServer(securityManager, fileServerPort)
+        val server = new HttpFileServer(conf, securityManager, fileServerPort)
         server.initialize()
         conf.set("spark.fileserver.uri",  server.serverUri)
         server
@@ -319,6 +355,10 @@ object SparkEnv extends Logging {
       // Then we can start the metrics system.
       MetricsSystem.createMetricsSystem("driver", conf, securityManager)
     } else {
+      // We need to set the executor ID before the MetricsSystem is created because sources and
+      // sinks specified in the metrics configuration file will want to incorporate this executor's
+      // ID into the metrics they report.
+      conf.set("spark.executor.id", executorId)
       val ms = MetricsSystem.createMetricsSystem("executor", conf, securityManager)
       ms.start()
       ms
@@ -328,7 +368,7 @@ object SparkEnv extends Logging {
     // this is a temporary directory; in distributed mode, this is the executor's current working
     // directory.
     val sparkFilesDir: String = if (isDriver) {
-      Utils.createTempDir().getAbsolutePath
+      Utils.createTempDir(Utils.getLocalDir(conf), "userFiles").getAbsolutePath
     } else {
       "."
     }
@@ -388,7 +428,7 @@ object SparkEnv extends Logging {
     val sparkProperties = (conf.getAll ++ schedulerMode).sorted
 
     // System properties that are not java classpaths
-    val systemProperties = System.getProperties.iterator.toSeq
+    val systemProperties = Utils.getSystemProperties.toSeq
     val otherProperties = systemProperties.filter { case (k, _) =>
       k != "java.class.path" && !k.startsWith("spark.")
     }.sorted

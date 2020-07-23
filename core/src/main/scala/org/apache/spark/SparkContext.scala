@@ -64,7 +64,7 @@ import org.apache.spark.util._
  * @param config a Spark Config object describing the application configuration. Any settings in
  *   this config overrides the default configs as well as system properties.
  */
-class SparkContext(config: SparkConf) extends Logging {
+class SparkContext(config: SparkConf) extends Logging with ExecutorAllocationClient {
 
   // The call site where this SparkContext was constructed.
   private val creationSite: CallSite = Utils.getCallSite()
@@ -84,6 +84,14 @@ class SparkContext(config: SparkConf) extends Logging {
   private[spark] var preferredNodeLocationData: Map[String, Set[SplitInfo]] = Map()
 
   val startTime = System.currentTimeMillis()
+
+  @volatile private var stopped: Boolean = false
+
+  private def assertNotStopped(): Unit = {
+    if (stopped) {
+      throw new IllegalStateException("Cannot call methods on a stopped SparkContext")
+    }
+  }
 
   /**
    * Create a SparkContext that loads settings from system properties (for instance, when
@@ -326,8 +334,13 @@ class SparkContext(config: SparkConf) extends Logging {
   try {
     dagScheduler = new DAGScheduler(this)
   } catch {
-    case e: Exception => throw
-      new SparkException("DAGScheduler cannot be initialized due to %s".format(e.getMessage))
+    case e: Exception => {
+      try {
+        stop()
+      } finally {
+        throw new SparkException("Error while constructing DAGScheduler", e)
+      }
+    }
   }
 
   // start TaskScheduler after taskScheduler sets DAGScheduler reference in DAGScheduler's
@@ -344,6 +357,8 @@ class SparkContext(config: SparkConf) extends Logging {
   // The metrics system for Driver need to be set spark.app.id to app ID.
   // So it should start after we get app ID from the task scheduler and set spark.app.id.
   metricsSystem.start()
+  // Attach the driver metrics servlet handler to the web ui after the metrics system is started.
+  metricsSystem.getServletHandlers.foreach(handler => ui.foreach(_.attachHandler(handler)))
 
   // Optionally log Spark events
   private[spark] val eventLogger: Option[EventLoggingListener] = {
@@ -359,7 +374,7 @@ class SparkContext(config: SparkConf) extends Logging {
   // Optionally scale number of executors dynamically based on workload. Exposed for testing.
   private[spark] val executorAllocationManager: Option[ExecutorAllocationManager] =
     if (conf.getBoolean("spark.dynamicAllocation.enabled", false)) {
-      Some(new ExecutorAllocationManager(this))
+      Some(new ExecutorAllocationManager(this, listenerBus, conf))
     } else {
       None
     }
@@ -507,12 +522,12 @@ class SparkContext(config: SparkConf) extends Logging {
 
   /** Distribute a local Scala collection to form an RDD.
    *
-   * @note Parallelize acts lazily. If `seq` is a mutable collection and is
-   * altered after the call to parallelize and before the first action on the
-   * RDD, the resultant RDD will reflect the modified collection. Pass a copy of
-   * the argument to avoid this.
+   * @note Parallelize acts lazily. If `seq` is a mutable collection and is altered after the call
+   * to parallelize and before the first action on the RDD, the resultant RDD will reflect the
+   * modified collection. Pass a copy of the argument to avoid this.
    */
   def parallelize[T: ClassTag](seq: Seq[T], numSlices: Int = defaultParallelism): RDD[T] = {
+    assertNotStopped()
     new ParallelCollectionRDD[T](this, seq, numSlices, Map[Int, Seq[String]]())
   }
 
@@ -528,6 +543,7 @@ class SparkContext(config: SparkConf) extends Logging {
     * location preferences (hostnames of Spark nodes) for each object.
     * Create a new partition for each collection item. */
   def makeRDD[T: ClassTag](seq: Seq[(T, Seq[String])]): RDD[T] = {
+    assertNotStopped()
     val indexToPrefs = seq.zipWithIndex.map(t => (t._2, t._1._2)).toMap
     new ParallelCollectionRDD[T](this, seq.map(_._1), seq.size, indexToPrefs)
   }
@@ -537,6 +553,7 @@ class SparkContext(config: SparkConf) extends Logging {
    * Hadoop-supported file system URI, and return it as an RDD of Strings.
    */
   def textFile(path: String, minPartitions: Int = defaultMinPartitions): RDD[String] = {
+    assertNotStopped()
     hadoopFile(path, classOf[TextInputFormat], classOf[LongWritable], classOf[Text],
       minPartitions).map(pair => pair._2.toString).setName(path)
   }
@@ -570,6 +587,7 @@ class SparkContext(config: SparkConf) extends Logging {
    */
   def wholeTextFiles(path: String, minPartitions: Int = defaultMinPartitions):
   RDD[(String, String)] = {
+    assertNotStopped()
     val job = new NewHadoopJob(hadoopConfiguration)
     NewFileInputFormat.addInputPath(job, new Path(path))
     val updateConf = job.getConfiguration
@@ -615,6 +633,7 @@ class SparkContext(config: SparkConf) extends Logging {
   @Experimental
   def binaryFiles(path: String, minPartitions: Int = defaultMinPartitions):
       RDD[(String, PortableDataStream)] = {
+    assertNotStopped()
     val job = new NewHadoopJob(hadoopConfiguration)
     NewFileInputFormat.addInputPath(job, new Path(path))
     val updateConf = job.getConfiguration
@@ -639,6 +658,7 @@ class SparkContext(config: SparkConf) extends Logging {
   @Experimental
   def binaryRecords(path: String, recordLength: Int, conf: Configuration = hadoopConfiguration)
       : RDD[Array[Byte]] = {
+    assertNotStopped()
     conf.setInt(FixedLengthBinaryInputFormat.RECORD_LENGTH_PROPERTY, recordLength)
     val br = newAPIHadoopFile[LongWritable, BytesWritable, FixedLengthBinaryInputFormat](path,
       classOf[FixedLengthBinaryInputFormat],
@@ -672,6 +692,7 @@ class SparkContext(config: SparkConf) extends Logging {
       valueClass: Class[V],
       minPartitions: Int = defaultMinPartitions
       ): RDD[(K, V)] = {
+    assertNotStopped()
     // Add necessary security credentials to the JobConf before broadcasting it.
     SparkHadoopUtil.get.addCredentials(conf)
     new HadoopRDD(this, conf, inputFormatClass, keyClass, valueClass, minPartitions)
@@ -691,6 +712,7 @@ class SparkContext(config: SparkConf) extends Logging {
       valueClass: Class[V],
       minPartitions: Int = defaultMinPartitions
       ): RDD[(K, V)] = {
+    assertNotStopped()
     // A Hadoop configuration can be about 10 KB, which is pretty big, so broadcast it.
     val confBroadcast = broadcast(new SerializableWritable(hadoopConfiguration))
     val setInputPathsFunc = (jobConf: JobConf) => FileInputFormat.setInputPaths(jobConf, path)
@@ -770,6 +792,7 @@ class SparkContext(config: SparkConf) extends Logging {
       kClass: Class[K],
       vClass: Class[V],
       conf: Configuration = hadoopConfiguration): RDD[(K, V)] = {
+    assertNotStopped()
     val job = new NewHadoopJob(conf)
     NewFileInputFormat.addInputPath(job, new Path(path))
     val updatedConf = job.getConfiguration
@@ -790,6 +813,7 @@ class SparkContext(config: SparkConf) extends Logging {
       fClass: Class[F],
       kClass: Class[K],
       vClass: Class[V]): RDD[(K, V)] = {
+    assertNotStopped()
     new NewHadoopRDD(this, fClass, kClass, vClass, conf)
   }
 
@@ -805,6 +829,7 @@ class SparkContext(config: SparkConf) extends Logging {
       valueClass: Class[V],
       minPartitions: Int
       ): RDD[(K, V)] = {
+    assertNotStopped()
     val inputFormatClass = classOf[SequenceFileInputFormat[K, V]]
     hadoopFile(path, inputFormatClass, keyClass, valueClass, minPartitions)
   }
@@ -816,9 +841,10 @@ class SparkContext(config: SparkConf) extends Logging {
     * If you plan to directly cache Hadoop writable objects, you should first copy them using
     * a `map` function.
     * */
-  def sequenceFile[K, V](path: String, keyClass: Class[K], valueClass: Class[V]
-      ): RDD[(K, V)] =
+  def sequenceFile[K, V](path: String, keyClass: Class[K], valueClass: Class[V]): RDD[(K, V)] = {
+    assertNotStopped()
     sequenceFile(path, keyClass, valueClass, defaultMinPartitions)
+  }
 
   /**
    * Version of sequenceFile() for types implicitly convertible to Writables through a
@@ -846,6 +872,7 @@ class SparkContext(config: SparkConf) extends Logging {
        (implicit km: ClassTag[K], vm: ClassTag[V],
         kcf: () => WritableConverter[K], vcf: () => WritableConverter[V])
       : RDD[(K, V)] = {
+    assertNotStopped()
     val kc = kcf()
     val vc = vcf()
     val format = classOf[SequenceFileInputFormat[Writable, Writable]]
@@ -867,6 +894,7 @@ class SparkContext(config: SparkConf) extends Logging {
       path: String,
       minPartitions: Int = defaultMinPartitions
       ): RDD[T] = {
+    assertNotStopped()
     sequenceFile(path, classOf[NullWritable], classOf[BytesWritable], minPartitions)
       .flatMap(x => Utils.deserialize[Array[T]](x._2.getBytes, Utils.getContextOrSparkClassLoader))
   }
@@ -941,7 +969,19 @@ class SparkContext(config: SparkConf) extends Logging {
    * [[org.apache.spark.broadcast.Broadcast]] object for reading it in distributed functions.
    * The variable will be sent to each cluster only once.
    */
+  /**
+   * add by yay(598775508) at 2015/1/11-20:00
+   * 广播一个只读的变量到集群，返回一个[[org.apache.spark.broadcast.Broadcast]]用于在分布式函数中读取变量
+   * 这个变量只会在每个集群中的发送一次
+   */
   def broadcast[T: ClassTag](value: T): Broadcast[T] = {
+    assertNotStopped()
+    if (classOf[RDD[_]].isAssignableFrom(classTag[T].runtimeClass)) {
+      // This is a warning instead of an exception in order to avoid breaking user programs that
+      // might have created RDD broadcast variables but not used them:
+      logWarning("Can not directly broadcast RDDs; instead, call collect() and "
+        + "broadcast the result (see SPARK-5063)")
+    }
     val bc = env.broadcastManager.newBroadcast[T](value, isLocal)
     val callSite = getCallSite
     logInfo("Created broadcast " + bc.id + " from " + callSite.shortForm)
@@ -988,7 +1028,7 @@ class SparkContext(config: SparkConf) extends Logging {
    * This is currently only supported in Yarn mode. Return whether the request is received.
    */
   @DeveloperApi
-  def requestExecutors(numAdditionalExecutors: Int): Boolean = {
+  override def requestExecutors(numAdditionalExecutors: Int): Boolean = {
     schedulerBackend match {
       case b: CoarseGrainedSchedulerBackend =>
         b.requestExecutors(numAdditionalExecutors)
@@ -1004,7 +1044,7 @@ class SparkContext(config: SparkConf) extends Logging {
    * This is currently only supported in Yarn mode. Return whether the request is received.
    */
   @DeveloperApi
-  def killExecutors(executorIds: Seq[String]): Boolean = {
+  override def killExecutors(executorIds: Seq[String]): Boolean = {
     schedulerBackend match {
       case b: CoarseGrainedSchedulerBackend =>
         b.killExecutors(executorIds)
@@ -1020,7 +1060,7 @@ class SparkContext(config: SparkConf) extends Logging {
    * This is currently only supported in Yarn mode. Return whether the request is received.
    */
   @DeveloperApi
-  def killExecutor(executorId: String): Boolean = killExecutors(Seq(executorId))
+  override def killExecutor(executorId: String): Boolean = super.killExecutor(executorId)
 
   /** The version of Spark on which this application is running. */
   def version = SPARK_VERSION
@@ -1030,6 +1070,7 @@ class SparkContext(config: SparkConf) extends Logging {
    * memory available for caching.
    */
   def getExecutorMemoryStatus: Map[String, (Long, Long)] = {
+    assertNotStopped()
     env.blockManager.master.getMemoryStatus.map { case(blockManagerId, mem) =>
       (blockManagerId.host + ":" + blockManagerId.port, mem)
     }
@@ -1042,6 +1083,7 @@ class SparkContext(config: SparkConf) extends Logging {
    */
   @DeveloperApi
   def getRDDStorageInfo: Array[RDDInfo] = {
+    assertNotStopped()
     val rddInfos = persistentRdds.values.map(RDDInfo.fromRdd).toArray
     StorageUtils.updateRddInfo(rddInfos, getExecutorStorageStatus)
     rddInfos.filter(_.isCached)
@@ -1059,6 +1101,7 @@ class SparkContext(config: SparkConf) extends Logging {
    */
   @DeveloperApi
   def getExecutorStorageStatus: Array[StorageStatus] = {
+    assertNotStopped()
     env.blockManager.master.getStorageStatus
   }
 
@@ -1068,6 +1111,7 @@ class SparkContext(config: SparkConf) extends Logging {
    */
   @DeveloperApi
   def getAllPools: Seq[Schedulable] = {
+    assertNotStopped()
     // TODO(xiajunluan): We should take nested pools into account
     taskScheduler.rootPool.schedulableQueue.toSeq
   }
@@ -1078,6 +1122,7 @@ class SparkContext(config: SparkConf) extends Logging {
    */
   @DeveloperApi
   def getPoolForName(pool: String): Option[Schedulable] = {
+    assertNotStopped()
     Option(taskScheduler.rootPool.schedulableNameToSchedulable.get(pool))
   }
 
@@ -1085,6 +1130,7 @@ class SparkContext(config: SparkConf) extends Logging {
    * Return current scheduling mode
    */
   def getSchedulingMode: SchedulingMode.SchedulingMode = {
+    assertNotStopped()
     taskScheduler.schedulingMode
   }
 
@@ -1190,16 +1236,14 @@ class SparkContext(config: SparkConf) extends Logging {
     SparkContext.SPARK_CONTEXT_CONSTRUCTOR_LOCK.synchronized {
       postApplicationEnd()
       ui.foreach(_.stop())
-      // Do this only if not stopped already - best case effort.
-      // prevent NPE if stopped more than once.
-      val dagSchedulerCopy = dagScheduler
-      dagScheduler = null
-      if (dagSchedulerCopy != null) {
+      if (!stopped) {
+        stopped = true
         env.metricsSystem.report()
         metadataCleaner.cancel()
         env.actorSystem.stop(heartbeatReceiver)
         cleaner.foreach(_.stop())
-        dagSchedulerCopy.stop()
+        dagScheduler.stop()
+        dagScheduler = null
         taskScheduler = null
         // TODO: Cache.stop()?
         env.stop()
@@ -1254,6 +1298,11 @@ class SparkContext(config: SparkConf) extends Logging {
    * Capture the current user callsite and return a formatted version for printing. If the user
    * has overridden the call site using `setCallSite()`, this will return the user's version.
    */
+  /**
+   * add by yay(598775508) at 2015/1/21-18:16
+   * 捕获当前用户代码调用的堆栈信息，也就是在哪个用户类的多少行开始调用sparkCore包中的相关方法，比如：count at StageNameTest:12
+   * 具体可以参考：http://dataknocker.github.io/2014/09/11/spark-stage命名/
+   */
   private[spark] def getCallSite(): CallSite = {
     Option(getLocalProperty(CallSite.SHORT_FORM)).map { case shortCallSite =>
       val longCallSite = Option(getLocalProperty(CallSite.LONG_FORM)).getOrElse("")
@@ -1273,9 +1322,10 @@ class SparkContext(config: SparkConf) extends Logging {
       partitions: Seq[Int],
       allowLocal: Boolean,
       resultHandler: (Int, U) => Unit) {
-    if (dagScheduler == null) {
-      throw new SparkException("SparkContext has been shutdown")
+    if (stopped) {
+      throw new IllegalStateException("SparkContext has been shutdown")
     }
+    //callSite表示用户代码调用SparkCore包中类的堆栈信息
     val callSite = getCallSite
     val cleanedFunc = clean(func)
     logInfo("Starting job: " + callSite.shortForm)
@@ -1305,6 +1355,10 @@ class SparkContext(config: SparkConf) extends Logging {
    * Run a job on a given set of partitions of an RDD, but take a function of type
    * `Iterator[T] => U` instead of `(TaskContext, Iterator[T]) => U`.
    */
+  /**
+   * add by yay(598775508) at 2015/1/14-22:38
+   * 注意的是下面的func实际上就是交给executor执行task的代码，它必须要能被序列化和反序列化
+   */
   def runJob[T, U: ClassTag](
       rdd: RDD[T],
       func: Iterator[T] => U,
@@ -1316,6 +1370,15 @@ class SparkContext(config: SparkConf) extends Logging {
 
   /**
    * Run a job on all partitions in an RDD and return the results in an array.
+   */
+  /**
+   * 在RDD的所有partition上执行job，然后返回结果集
+   * 比如：runJob(self, writeToFile)
+   * @param rdd
+   * @param func 在RDD的partition上要执行的操作函数，比如writeToFile
+   * @tparam T RDD的类型
+   * @tparam U 结果集的类型
+   * @return
    */
   def runJob[T, U: ClassTag](rdd: RDD[T], func: (TaskContext, Iterator[T]) => U): Array[U] = {
     runJob(rdd, func, 0 until rdd.partitions.size, false)
@@ -1361,6 +1424,7 @@ class SparkContext(config: SparkConf) extends Logging {
       func: (TaskContext, Iterator[T]) => U,
       evaluator: ApproximateEvaluator[U, R],
       timeout: Long): PartialResult[R] = {
+    assertNotStopped()
     val callSite = getCallSite
     logInfo("Starting job: " + callSite.shortForm)
     val start = System.nanoTime
@@ -1375,6 +1439,18 @@ class SparkContext(config: SparkConf) extends Logging {
    * :: Experimental ::
    * Submit a job for execution and return a FutureJob holding the result.
    */
+  /**
+   * add by yay(598775508) at 2015/1/22-16:05
+   * @param rdd
+   * @param processPartition 定义如何计算 partition 中的 records 得到 result
+   * @param partitions
+   * @param resultHandler 定义如何对从各个 partition 收集来的 results 进行计算来得到最终结果
+   * @param resultFunc 对最终结果做进一步处理的函数，比如：count, collect, reduce
+   * @tparam T RDD的类型
+   * @tparam U processPartition返回的结果类型
+   * @tparam R resultFunc返回的结果类型
+   * @return
+   */
   @Experimental
   def submitJob[T, U, R](
       rdd: RDD[T],
@@ -1383,6 +1459,9 @@ class SparkContext(config: SparkConf) extends Logging {
       resultHandler: (Int, U) => Unit,
       resultFunc: => R): SimpleFutureAction[R] =
   {
+    //cleanF 是 processParittion 经过闭包清理后的结果，
+    // 这样可以被序列化后传递给不同节点的 task。
+    assertNotStopped()
     val cleanF = clean(processPartition)
     val callSite = getCallSite
     val waiter = dagScheduler.submitJob(
@@ -1401,11 +1480,13 @@ class SparkContext(config: SparkConf) extends Logging {
    * for more information.
    */
   def cancelJobGroup(groupId: String) {
+    assertNotStopped()
     dagScheduler.cancelJobGroup(groupId)
   }
 
   /** Cancel all jobs that have been scheduled or are running.  */
   def cancelAllJobs() {
+    assertNotStopped()
     dagScheduler.cancelAllJobs()
   }
 
@@ -1431,6 +1512,10 @@ class SparkContext(config: SparkConf) extends Logging {
    * @throws <tt>SparkException<tt> if <tt>checkSerializable</tt> is set but <tt>f</tt> is not
    *   serializable
    */
+  /**
+   * add by yay(598775508) at 2015/1/14-22:30
+   * TODO：清理一个闭包？没看懂这个clean做了什么，有清楚的朋友还请指教
+   */
   private[spark] def clean[F <: AnyRef](f: F, checkSerializable: Boolean = true): F = {
     ClosureCleaner.clean(f, checkSerializable)
     f
@@ -1452,7 +1537,10 @@ class SparkContext(config: SparkConf) extends Logging {
   def getCheckpointDir = checkpointDir
 
   /** Default level of parallelism to use when not given by user (e.g. parallelize and makeRDD). */
-  def defaultParallelism: Int = taskScheduler.defaultParallelism
+  def defaultParallelism: Int = {
+    assertNotStopped()
+    taskScheduler.defaultParallelism
+  }
 
   /** Default min number of partitions for Hadoop RDDs when not given by user */
   @deprecated("use defaultMinPartitions", "1.0.0")

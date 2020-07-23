@@ -36,6 +36,8 @@ import org.apache.spark.util.{ActorLogReceive, AkkaUtils, Utils}
 /**
  * BlockManagerMasterActor is an actor on the master node to track statuses of
  * all slaves' block managers.
+ *
+ * BlockManagerMasterActor是一个位于Master节点上的Actor，用于跟踪所有 Slave BlockManager的状态
  */
 private[spark]
 class BlockManagerMasterActor(val isLocal: Boolean, conf: SparkConf, listenerBus: LiveListenerBus)
@@ -67,6 +69,7 @@ class BlockManagerMasterActor(val isLocal: Boolean, conf: SparkConf, listenerBus
   }
 
   override def receiveWithLogging = {
+//    只会由executor端的ref向client driver端的actor发送
     case RegisterBlockManager(blockManagerId, maxMemSize, slaveActor) =>
       register(blockManagerId, maxMemSize, slaveActor)
       sender ! true
@@ -113,7 +116,7 @@ class BlockManagerMasterActor(val isLocal: Boolean, conf: SparkConf, listenerBus
     case RemoveBlock(blockId) =>
       removeBlockFromWorkers(blockId)
       sender ! true
-
+//      只会由client driver端的ref向client driver端的actor发送
     case RemoveExecutor(execId) =>
       removeExecutor(execId)
       sender ! true

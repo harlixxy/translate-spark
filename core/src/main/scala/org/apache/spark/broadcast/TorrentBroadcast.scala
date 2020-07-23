@@ -51,6 +51,20 @@ import org.apache.spark.util.io.ByteArrayChunkOutputStream
  *
  * @param obj object to broadcast
  * @param id A unique identifier for the broadcast variable.
+ *
+ * [[org.apache.spark.broadcast.Broadcast]] 的一个类似比特流方式的实现。
+ *
+ * 实现机制如下：
+ * driver 将序列化的对象拆分成小数据块，并将这些数据块存储到 driver 的 BlockManager。
+ *
+ * 在每个 executor， 首先会尝试从它自己的 BlockManager 中获取对象。 如果对象不存在，
+ * 就从 driver 和/或其他可用的 executors 上远程获取小数据块。 一旦获取了这些数据块，
+ * 就会放到它自己的 BlockManager，以方便其他 executors 从中获取数据块。
+ *
+ * 这可以避免 driver 在广播多份数据（一个 Executor 广播一份）拷贝所带来的瓶颈问题，就像
+ *  [[org.apache.spark.broadcast.HttpBroadcast]] 那样。
+ *
+ *  当初始化时，TorrentBroadcast 对象会读取 SparkEnv.get.conf。
  */
 private[spark] class TorrentBroadcast[T: ClassTag](obj: T, id: Long)
   extends Broadcast[T](id) with Logging with Serializable {
@@ -92,14 +106,20 @@ private[spark] class TorrentBroadcast[T: ClassTag](obj: T, id: Long)
    * @param value the object to divide
    * @return number of blocks this broadcast variable is divided into
    */
+  /**
+   * add by yay(598775508) at 2015/1/12-21:26
+   * 将对象分隔成多个数据块，同时把这些数据块放到block manager上
+   */
   private def writeBlocks(value: T): Int = {
     // Store a copy of the broadcast variable in the driver so that tasks run on the driver
     // do not create a duplicate copy of the broadcast variable's value.
     SparkEnv.get.blockManager.putSingle(broadcastId, value, StorageLevel.MEMORY_AND_DISK,
       tellMaster = false)
+//    下面方法将对象obj分块（默认块大小为4M）
     val blocks =
       TorrentBroadcast.blockifyObject(value, blockSize, SparkEnv.get.serializer, compressionCodec)
     blocks.zipWithIndex.foreach { case (block, i) =>
+//      将数据块放到block manager上去
       SparkEnv.get.blockManager.putBytes(
         BroadcastBlockId(id, "piece" + i),
         block,

@@ -27,7 +27,7 @@ import akka.actor._
 import akka.pattern.ask
 import akka.remote.{DisassociatedEvent, RemotingLifecycleEvent}
 
-import org.apache.spark.{SparkEnv, Logging, SparkException, TaskState}
+import org.apache.spark.{ExecutorAllocationClient, Logging, SparkEnv, SparkException, TaskState}
 import org.apache.spark.scheduler.{SchedulerBackend, SlaveLost, TaskDescription, TaskSchedulerImpl, WorkerOffer}
 import org.apache.spark.scheduler.cluster.CoarseGrainedClusterMessages._
 import org.apache.spark.util.{ActorLogReceive, SerializableBuffer, AkkaUtils, Utils}
@@ -41,14 +41,14 @@ import org.apache.spark.util.{ActorLogReceive, SerializableBuffer, AkkaUtils, Ut
  * (spark.deploy.*).
  *
  * 调度器后台，等待Exexutor接入（通过Akka)。
- * 该后台会在Spark Job运行期间一直持有每一个Exexutor，而不是task一
- * 结束后就放弃Exexutor、新的task则再启动一个Exexutor这种低效的方式。
+ * 该后台会在Spark Job运行期间一直持有每一个Exexutor，而不是当task完成
+ * 后就立即放弃Exexutor、新的task则再启动一个Exexutor这种低效的方式。
  *
  * 该类通过内部类DriverActor实现了对资源的调度，并通过SchedulerBackend接口为外界服务
  */
 private[spark]
 class CoarseGrainedSchedulerBackend(scheduler: TaskSchedulerImpl, val actorSystem: ActorSystem)
-  extends SchedulerBackend with Logging
+  extends ExecutorAllocationClient with SchedulerBackend with Logging
 {
   // Use an atomic variable to track total number of cores in the cluster for simplicity and speed
   var totalCoreCount = new AtomicInteger(0)
@@ -90,6 +90,7 @@ class CoarseGrainedSchedulerBackend(scheduler: TaskSchedulerImpl, val actorSyste
     }
 
     def receiveWithLogging = {
+      //ExecutorBackend启动的时候会向Driver注册
       case RegisterExecutor(executorId, hostPort, cores) =>
         Utils.checkHostPort(hostPort, "Host port expected " + hostPort)
         if (executorDataMap.contains(executorId)) {
@@ -116,6 +117,7 @@ class CoarseGrainedSchedulerBackend(scheduler: TaskSchedulerImpl, val actorSyste
         }
 
       case StatusUpdate(executorId, taskId, state, data) =>
+        //告诉 taskScheduler 这个 task 已经执行完
         scheduler.statusUpdate(taskId, state, data.value)
         if (TaskState.isFinished(state)) {
           executorDataMap.get(executorId) match {
@@ -182,6 +184,7 @@ class CoarseGrainedSchedulerBackend(scheduler: TaskSchedulerImpl, val actorSyste
     def launchTasks(tasks: Seq[Seq[TaskDescription]]) {
       for (task <- tasks.flatten) {
         val ser = SparkEnv.get.closureSerializer.newInstance()
+        //把每个Task序列化
         val serializedTask = ser.serialize(task)
         if (serializedTask.limit >= akkaFrameSize - AkkaUtils.reservedSizeBytes) {
           val taskSetId = scheduler.taskIdToTaskSetId(task.taskId)
@@ -199,6 +202,7 @@ class CoarseGrainedSchedulerBackend(scheduler: TaskSchedulerImpl, val actorSyste
           }
         }
         else {
+          //如果序列化大小不超过 Akka 的 akkaFrameSize，那么直接将 task 送到 executor 那里执行
           val executorData = executorDataMap(task.executorId)
           executorData.freeCores -= scheduler.CPUS_PER_TASK
           executorData.executorActor ! LaunchTask(new SerializableBuffer(serializedTask))
@@ -313,7 +317,7 @@ class CoarseGrainedSchedulerBackend(scheduler: TaskSchedulerImpl, val actorSyste
    * Request an additional number of executors from the cluster manager.
    * Return whether the request is acknowledged.
    */
-  final def requestExecutors(numAdditionalExecutors: Int): Boolean = synchronized {
+  final override def requestExecutors(numAdditionalExecutors: Int): Boolean = synchronized {
     logInfo(s"Requesting $numAdditionalExecutors additional executor(s) from the cluster manager")
     logDebug(s"Number of pending executors is now $numPendingExecutors")
     numPendingExecutors += numAdditionalExecutors
@@ -340,7 +344,7 @@ class CoarseGrainedSchedulerBackend(scheduler: TaskSchedulerImpl, val actorSyste
    * Request that the cluster manager kill the specified executors.
    * Return whether the kill request is acknowledged.
    */
-  final def killExecutors(executorIds: Seq[String]): Boolean = {
+  final override def killExecutors(executorIds: Seq[String]): Boolean = synchronized {
     logInfo(s"Requesting to kill executor(s) ${executorIds.mkString(", ")}")
     val filteredExecutorIds = new ArrayBuffer[String]
     executorIds.foreach { id =>

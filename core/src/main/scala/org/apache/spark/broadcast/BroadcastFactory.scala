@@ -29,6 +29,9 @@ import org.apache.spark.annotation.DeveloperApi
  * multiple broadcast implementations). SparkContext uses a user-specified
  * BroadcastFactory implementation to instantiate a particular broadcast for the
  * entire Spark job.
+ *
+ *  广播工厂，封装了Spark中使用的全部广播实现类。SparkContext 使用用户指定的
+ *  BroadcastFactory 的实现类为整个 Spark job 实例化一个特定的广播类。
  */
 @DeveloperApi
 trait BroadcastFactory {
@@ -37,7 +40,7 @@ trait BroadcastFactory {
 
   /**
    * Creates a new broadcast variable.
-   *
+   * 创建一个新的广播变量值
    * @param value value to broadcast
    * @param isLocal whether we are in local mode (single JVM process)
    * @param id unique id representing this broadcast variable

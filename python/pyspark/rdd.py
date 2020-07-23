@@ -141,6 +141,17 @@ class RDD(object):
     def __repr__(self):
         return self._jrdd.toString()
 
+    def __getnewargs__(self):
+        # This method is called when attempting to pickle an RDD, which is always an error:
+        raise Exception(
+            "It appears that you are attempting to broadcast an RDD or reference an RDD from an "
+            "action or transformation. RDD transformations and actions can only be invoked by the "
+            "driver, not inside of other transformations; for example, "
+            "rdd1.map(lambda x: rdd2.values.count() * x) is invalid because the values "
+            "transformation and count action cannot be performed inside of the rdd1.map "
+            "transformation. For more information, see SPARK-5063."
+        )
+
     @property
     def context(self):
         """
@@ -469,8 +480,7 @@ class RDD(object):
     def _reserialize(self, serializer=None):
         serializer = serializer or self.ctx.serializer
         if self._jrdd_deserializer != serializer:
-            if not isinstance(self, PipelinedRDD):
-                self = self.map(lambda x: x, preservesPartitioning=True)
+            self = self.map(lambda x: x, preservesPartitioning=True)
             self._jrdd_deserializer = serializer
         return self
 
@@ -1291,7 +1301,7 @@ class RDD(object):
 
     def collectAsMap(self):
         """
-        Return the key-value pairs in this RDD to the master as a dictionary.
+        Return the key-value pairs in this RDD to the main as a dictionary.
 
         >>> m = sc.parallelize([(1, 2), (3, 4)]).collectAsMap()
         >>> m[1]
@@ -1341,7 +1351,7 @@ class RDD(object):
     def reduceByKeyLocally(self, func):
         """
         Merge the values for each key using an associative reduce function, but
-        return the results immediately to the master as a dictionary.
+        return the results immediately to the main as a dictionary.
 
         This will also perform the merging locally on each mapper before
         sending results to a reducer, similarly to a "combiner" in MapReduce.
@@ -1366,7 +1376,7 @@ class RDD(object):
     def countByKey(self):
         """
         Count the number of elements for each key, and return the result to the
-        master as a dictionary.
+        main as a dictionary.
 
         >>> rdd = sc.parallelize([("a", 1), ("b", 1), ("a", 1)])
         >>> sorted(rdd.countByKey().items())
@@ -1798,23 +1808,21 @@ class RDD(object):
         def get_batch_size(ser):
             if isinstance(ser, BatchedSerializer):
                 return ser.batchSize
-            return 1
+            return 1  # not batched
 
         def batch_as(rdd, batchSize):
-            ser = rdd._jrdd_deserializer
-            if isinstance(ser, BatchedSerializer):
-                ser = ser.serializer
-            return rdd._reserialize(BatchedSerializer(ser, batchSize))
+            return rdd._reserialize(BatchedSerializer(PickleSerializer(), batchSize))
 
         my_batch = get_batch_size(self._jrdd_deserializer)
         other_batch = get_batch_size(other._jrdd_deserializer)
-        # use the smallest batchSize for both of them
-        batchSize = min(my_batch, other_batch)
-        if batchSize <= 0:
-            # auto batched or unlimited
-            batchSize = 100
-        other = batch_as(other, batchSize)
-        self = batch_as(self, batchSize)
+        if my_batch != other_batch:
+            # use the smallest batchSize for both of them
+            batchSize = min(my_batch, other_batch)
+            if batchSize <= 0:
+                # auto batched or unlimited
+                batchSize = 100
+            other = batch_as(other, batchSize)
+            self = batch_as(self, batchSize)
 
         if self.getNumPartitions() != other.getNumPartitions():
             raise ValueError("Can only zip with RDD which has the same number of partitions")

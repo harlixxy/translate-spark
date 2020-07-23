@@ -64,14 +64,14 @@ class SparkContext(object):
     _lock = Lock()
     _python_includes = None  # zip and egg files that need to be added to PYTHONPATH
 
-    def __init__(self, master=None, appName=None, sparkHome=None, pyFiles=None,
+    def __init__(self, main=None, appName=None, sparkHome=None, pyFiles=None,
                  environment=None, batchSize=0, serializer=PickleSerializer(), conf=None,
                  gateway=None, jsc=None):
         """
-        Create a new SparkContext. At least the master and app name should be set,
+        Create a new SparkContext. At least the main and app name should be set,
         either through the named parameters here or through C{conf}.
 
-        :param master: Cluster URL to connect to
+        :param main: Cluster URL to connect to
                (e.g. mesos://host:port, spark://host:port, local[4]).
         :param appName: A name for your job, to display on the cluster web UI.
         :param sparkHome: Location where Spark is installed on cluster nodes.
@@ -101,14 +101,14 @@ class SparkContext(object):
         self._callsite = first_spark_call() or CallSite(None, None, None)
         SparkContext._ensure_initialized(self, gateway=gateway)
         try:
-            self._do_init(master, appName, sparkHome, pyFiles, environment, batchSize, serializer,
+            self._do_init(main, appName, sparkHome, pyFiles, environment, batchSize, serializer,
                           conf, jsc)
         except:
             # If an error occurs, clean up in order to allow future SparkContext creation:
             self.stop()
             raise
 
-    def _do_init(self, master, appName, sparkHome, pyFiles, environment, batchSize, serializer,
+    def _do_init(self, main, appName, sparkHome, pyFiles, environment, batchSize, serializer,
                  conf, jsc):
         self.environment = environment or {}
         self._conf = conf or SparkConf(_jvm=self._jvm)
@@ -121,8 +121,8 @@ class SparkContext(object):
                                                 batchSize)
 
         # Set any parameters passed directly to us on the conf
-        if master:
-            self._conf.setMaster(master)
+        if main:
+            self._conf.setMain(main)
         if appName:
             self._conf.setAppName(appName)
         if sparkHome:
@@ -134,14 +134,14 @@ class SparkContext(object):
             self._conf.setIfMissing(key, value)
 
         # Check that we have at least the required parameters
-        if not self._conf.contains("spark.master"):
-            raise Exception("A master URL must be set in your configuration")
+        if not self._conf.contains("spark.main"):
+            raise Exception("A main URL must be set in your configuration")
         if not self._conf.contains("spark.app.name"):
             raise Exception("An application name must be set in your configuration")
 
         # Read back our properties from the conf in case we loaded some of them from
         # the classpath or an external config file
-        self.master = self._conf.get("spark.master")
+        self.main = self._conf.get("spark.main")
         self.appName = self._conf.get("spark.app.name")
         self.sparkHome = self._conf.get("spark.home", None)
         for (k, v) in self._conf.getAll():
@@ -189,7 +189,8 @@ class SparkContext(object):
         # Create a temporary directory inside spark.local.dir:
         local_dir = self._jvm.org.apache.spark.util.Utils.getLocalDir(self._jsc.sc().conf())
         self._temp_dir = \
-            self._jvm.org.apache.spark.util.Utils.createTempDir(local_dir).getAbsolutePath()
+            self._jvm.org.apache.spark.util.Utils.createTempDir(local_dir, "pyspark") \
+                .getAbsolutePath()
 
         # profiling stats collected for each PythonRDD
         self._profile_stats = []
@@ -215,19 +216,27 @@ class SparkContext(object):
             if instance:
                 if (SparkContext._active_spark_context and
                         SparkContext._active_spark_context != instance):
-                    currentMaster = SparkContext._active_spark_context.master
+                    currentMain = SparkContext._active_spark_context.main
                     currentAppName = SparkContext._active_spark_context.appName
                     callsite = SparkContext._active_spark_context._callsite
 
                     # Raise error if there is already a running Spark context
                     raise ValueError(
                         "Cannot run multiple SparkContexts at once; "
-                        "existing SparkContext(app=%s, master=%s)"
+                        "existing SparkContext(app=%s, main=%s)"
                         " created by %s at %s:%s "
-                        % (currentAppName, currentMaster,
+                        % (currentAppName, currentMain,
                             callsite.function, callsite.file, callsite.linenum))
                 else:
                     SparkContext._active_spark_context = instance
+
+    def __getnewargs__(self):
+        # This method is called when attempting to pickle SparkContext, which is always an error:
+        raise Exception(
+            "It appears that you are attempting to reference SparkContext from a broadcast "
+            "variable, action, or transforamtion. SparkContext can only be used on the driver, "
+            "not in code that it run on workers. For more information, see SPARK-5063."
+        )
 
     def __enter__(self):
         """
@@ -319,7 +328,7 @@ class SparkContext(object):
         # Make sure we distribute data evenly if it's smaller than self.batchSize
         if "__len__" not in dir(c):
             c = list(c)    # Make it a list so we can compute its length
-        batchSize = max(1, min(len(c) // numSlices, self._batchSize))
+        batchSize = max(1, min(len(c) // numSlices, self._batchSize or 1024))
         serializer = BatchedSerializer(self._unbatched_serializer, batchSize)
         serializer.dump_stream(c, tempFile)
         tempFile.close()

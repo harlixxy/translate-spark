@@ -62,6 +62,16 @@ private[spark] class BlockResult(
  * retrieving blocks both locally and remotely into various stores (memory, disk, and off-heap).
  *
  * Note that #initialize() must be called before the BlockManager is usable.
+ *
+ * BlockManager运行在每一个节点上（Master和所有的Executor)，
+ * 提供了提供了存、取本地及远程数据块道各种存储(内存，磁盘及 tackyon)的接口
+ *
+ * 注意：BlockManager在使用前必须调用 #initialize()方法
+ */
+/**
+ * add by yay(598775508) at 2015/1/9-14:09
+ * 每个节点都有一个BlockManager, 其中有一个是Driver(master), 其余的都是slave
+ * BlockManager是被master和slave公用的, 但对于master的逻辑都已经wrap在BlockManagerMaster中了
  */
 private[spark] class BlockManager(
     executorId: String,
@@ -189,6 +199,22 @@ private[spark] class BlockManager(
    * This method initializes the BlockTransferService and ShuffleClient, registers with the
    * BlockManagerMaster, starts the BlockManagerWorker actor, and registers with a local shuffle
    * service if configured.
+   *
+   * 使用给定的appId初始化BlockManager。 这个过程没有在构造函数完成，是因为在实例化BlockManager的时候，
+   * appId可嫩还无法获取。
+   *
+   * 该方法初始化了BlockTransferService 和 ShuffleClient，并注册了BlockManagerMaster，启动了BlockManagerWorker
+   * Actor(1.2版后改名为BlockManagerSlaveActor），并根据配置文件，注册一个本地的shuffle service。
+   */
+  /**
+   * add by yay(598775508) at 2015/1/8-21:53
+   * 根据给定的appId初始BlockManager
+   * 对应前面说了一堆的：Note that #initialize() must be called before the BlockManager is usable.
+   * 之所以不在构造函数中执行初始化，是因为那个时候还不知道appId是啥。要等 taskScheduler.start()之后（会把application注册到Master）才会调用这个方法，可以在SparkContext中找到如下代码验证：
+   *  taskScheduler.start()
+      val applicationId: String = taskScheduler.applicationId()
+      conf.set("spark.app.id", applicationId)
+      env.blockManager.initialize(applicationId)   *
    */
   def initialize(appId: String): Unit = {
     blockTransferService.init(this)
@@ -203,6 +229,10 @@ private[spark] class BlockManager(
       blockManagerId
     }
 
+    /**
+     * add by yay(598775508) at 2015/1/8-22:19
+     * blockManager向Driver注册，并传递了自身的slaveActor
+     */
     master.registerBlockManager(blockManagerId, maxMemory, slaveActor)
 
     // Register Executors' configuration with the local shuffle service, if one should exist.
@@ -360,6 +390,7 @@ private[spark] class BlockManager(
       info: BlockInfo,
       status: BlockStatus,
       droppedMemorySize: Long = 0L): Unit = {
+    // 如果返回false, 说明你发的blockid在master没有, 需要重新注册
     val needReregister = !tryToReportBlockStatus(blockId, info, status, droppedMemorySize)
     if (needReregister) {
       logInfo(s"Got told to re-register updating block $blockId")
@@ -464,6 +495,9 @@ private[spark] class BlockManager(
         // Note that this only checks metadata tracking. If user intentionally deleted the block
         // on disk or from off heap storage without using removeBlock, this conditional check will
         // still pass but eventually we will get an exception because we can't find the block.
+        // 两次检查确保数据块的存在。存在一个很小的几率，数据在获取前被移除。
+        // 注 这里仅仅是检查跟踪的元数据。如果用户没有使用 removeBlock 方法，而是蓄意删除掉磁盘上的文件，
+        // 这种情况是无法检查到的，最终我们会因无法找到数据块而引发一个异常。
         if (blockInfo.get(blockId).isEmpty) {
           logWarning(s"Block $blockId had been removed")
           return None
@@ -478,7 +512,13 @@ private[spark] class BlockManager(
 
         val level = info.level
         logDebug(s"Level for block $blockId is $level")
-
+        /**
+         * add by yay(598775508) at 2015/1/9-13:28
+         * 1.level.useMemory == true：从memory中取出block并返回，若没有取到则进入分支2。
+         * 2.level.useDisk == true: level.useMemory == true: 将block从disk中读出并写入内存以便下次使用时直接从内存中获得，
+         *       同时返回该block；level.useMemory == false: 将block从disk中读出并返回
+         * 3.level.useDisk == false: 没有在本地找到block，返回None
+         * */
         // Look for the block in memory
         if (level.useMemory) {
           logDebug(s"Getting block $blockId from memory")
@@ -591,12 +631,15 @@ private[spark] class BlockManager(
 
   private def doGetRemote(blockId: BlockId, asBlockResult: Boolean): Option[Any] = {
     require(blockId != null, "BlockId is null")
+//   具体处理请查看BlockManagerMasterActor中的getLocations函数
     val locations = Random.shuffle(master.getLocations(blockId))
     for (loc <- locations) {
       logDebug(s"Getting remote block $blockId from $loc")
+//      根据location向远端发送请求获取block
       val data = blockTransferService.fetchBlockSync(
         loc.host, loc.port, loc.executorId, blockId.toString).nioByteBuffer()
 
+//      只要有一个远端返回block该函数就返回而不继续发送请求。
       if (data != null) {
         if (asBlockResult) {
           return Some(new BlockResult(
@@ -692,6 +735,8 @@ private[spark] class BlockManager(
    * The effective storage level refers to the level according to which the block will actually be
    * handled. This allows the caller to specify an alternate behavior of doPut while preserving
    * the original level specified by the user.
+   *
+   * 根据给定的存储level，保存数据，如果需要，制作数据的副本。
    */
   private def doPut(
       blockId: BlockId,
@@ -712,7 +757,9 @@ private[spark] class BlockManager(
 
     /* Remember the block's storage level so that we can correctly drop it to disk if it needs
      * to be dropped right after it got put into memory. Note, however, that other threads will
-     * not be able to get() this block until we call markReady on its BlockInfo. */
+     * not be able to get() this block until we call markReady on its BlockInfo.
+     *  记录当前Storage Level，以便我们在将数据复制到内存之后，还可以按需要复制到硬盘上
+     *  注：在我们调用BlockInfo的 markReady 方法之前，其他线程都没法通过get方法获得该Block内容 */
     val putBlockInfo = {
       val tinfo = new BlockInfo(level, tellMaster)
       // Do atomically !
@@ -736,6 +783,9 @@ private[spark] class BlockManager(
      * but because our put will read the whole iterator, there will be no values left. For the
      * case where the put serializes data, we'll remember the bytes, above; but for the case where
      * it doesn't, such as deserialized storage, let's rely on the put returning an Iterator. */
+    /* 如果我们不仅需要存储数据，并且要复制数据到别的机器，那么我们需要再次访问这些数据，但是因为我们的put操作操作时，
+     * iterator已经迭代到末尾了，当前Iterator已经无法读取了。对于保存序列化的数据的场景，我们可以记住这些bytes，
+     * 但在其他场景，比如反序列化存储的时候，我们就必须依赖返回一个Iterator*/
     var valuesAfterPut: Iterator[Any] = null
 
     // Ditto for the bytes after the put
@@ -760,15 +810,19 @@ private[spark] class BlockManager(
     putBlockInfo.synchronized {
       logTrace("Put for block %s took %s to get into synchronized block"
         .format(blockId, Utils.getUsedTimeMs(startTimeMs)))
-
+//标志该blockInfo不能被读取
       var marked = false
       try {
         // returnValues - Whether to return the values put
         // blockStore - The type of storage to put these values into
+        // returnValues - 是否返回保存的数据
+        // blockStore - 数据的存储类型
         val (returnValues, blockStore: BlockStore) = {
           if (putLevel.useMemory) {
             // Put it in memory first, even if it also has useDisk set to true;
             // We will drop it to disk later if the memory store can't hold it.
+            // 首先保存到内存中，即使putLevel设置了useDisk = true
+            // 如果内存装不下，我们随后会把数据丢到disk上
             (true, memoryStore)
           } else if (putLevel.useOffHeap) {
             // Use tachyon for off-heap storage
@@ -810,6 +864,7 @@ private[spark] class BlockManager(
           // Now that the block is in either the memory, tachyon, or disk store,
           // let other threads read it, and tell the master about it.
           marked = true
+//          标志该Block已经可以被读取了
           putBlockInfo.markReady(size)
           if (tellMaster) {
             reportBlockStatus(blockId, putBlockInfo, putBlockStatus)
@@ -1016,8 +1071,10 @@ private[spark] class BlockManager(
           // If we get here, the block write failed.
           logWarning(s"Block $blockId was marked as failure. Nothing to drop")
           return None
+        } else if (blockInfo.get(blockId).isEmpty) {
+          logWarning(s"Block $blockId was already dropped.")
+          return None
         }
-
         var blockIsUpdated = false
         val level = info.level
 

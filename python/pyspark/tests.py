@@ -533,6 +533,15 @@ class RDDTests(ReusedPySparkTestCase):
         a = a._reserialize(BatchedSerializer(PickleSerializer(), 2))
         b = b._reserialize(MarshalSerializer())
         self.assertEqual(a.zip(b).collect(), [(0, 100), (1, 101), (2, 102), (3, 103), (4, 104)])
+        # regression test for SPARK-4841
+        path = os.path.join(SPARK_HOME, "python/test_support/hello.txt")
+        t = self.sc.textFile(path)
+        cnt = t.count()
+        self.assertEqual(cnt, t.zip(t).count())
+        rdd = t.map(str)
+        self.assertEqual(cnt, t.zip(rdd).count())
+        # regression test for bug in _reserializer()
+        self.assertEqual(cnt, t.zip(rdd).count())
 
     def test_zip_with_different_number_of_items(self):
         a = self.sc.parallelize(range(5), 2)
@@ -1656,7 +1665,7 @@ class SparkSubmitTests(unittest.TestCase):
             |def myfunc(x):
             |    return x + 1
             """)
-        proc = subprocess.Popen([self.sparkSubmit, "--py-files", zip, "--master",
+        proc = subprocess.Popen([self.sparkSubmit, "--py-files", zip, "--main",
                                 "local-cluster[1,1,512]", script],
                                 stdout=subprocess.PIPE)
         out, err = proc.communicate()
@@ -1677,7 +1686,7 @@ class SparkSubmitTests(unittest.TestCase):
         # this will fail if you have different spark.executor.memory
         # in conf/spark-defaults.conf
         proc = subprocess.Popen(
-            [self.sparkSubmit, "--master", "local-cluster[1,1,512]", script],
+            [self.sparkSubmit, "--main", "local-cluster[1,1,512]", script],
             stdout=subprocess.PIPE)
         out, err = proc.communicate()
         self.assertEqual(0, proc.returncode)
@@ -1688,7 +1697,7 @@ class ContextTests(unittest.TestCase):
 
     def test_failed_sparkcontext_creation(self):
         # Regression test for SPARK-1550
-        self.assertRaises(Exception, lambda: SparkContext("an-invalid-master-name"))
+        self.assertRaises(Exception, lambda: SparkContext("an-invalid-main-name"))
 
     def test_stop(self):
         sc = SparkContext()

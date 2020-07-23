@@ -23,7 +23,7 @@ import java.text.SimpleDateFormat
 import java.util.{UUID, Date}
 
 import scala.collection.JavaConversions._
-import scala.collection.mutable.HashMap
+import scala.collection.mutable.{HashMap, HashSet}
 import scala.concurrent.duration._
 import scala.language.postfixOps
 import scala.util.Random
@@ -60,6 +60,7 @@ private[spark] class Worker(
   Utils.checkHost(host, "Expected hostname")
   assert (port > 0)
 
+  // worker and executor ID 中添加时间戳，保证其唯一性
   def createDateFormat = new SimpleDateFormat("yyyyMMddHHmmss")  // For worker and executor IDs
 
   // Send a heartbeat every (heartbeat timeout) / 4 milliseconds
@@ -70,6 +71,7 @@ private[spark] class Worker(
   // Afterwards, the next 10 attempts are between 30 and 90 seconds.
   // A bit of randomness is introduced so that not all of the workers attempt to reconnect at
   // the same time.
+  // 对Worker的重联进行分散化处理，避免集中重联对Master的冲击  两种策略 5-15， 30-90
   val INITIAL_REGISTRATION_RETRIES = 6
   val TOTAL_REGISTRATION_RETRIES = INITIAL_REGISTRATION_RETRIES + 10
   val FUZZ_MULTIPLIER_INTERVAL_LOWER_BOUND = 0.500
@@ -109,8 +111,11 @@ private[spark] class Worker(
   val finishedExecutors = new HashMap[String, ExecutorRunner]
   val drivers = new HashMap[String, DriverRunner]
   val finishedDrivers = new HashMap[String, DriverRunner]
+  val appDirectories = new HashMap[String, Seq[String]]
+  val finishedApps = new HashSet[String]
 
   // The shuffle service is not actually started unless configured.
+  // 除非配置过,不然这个shuffle服务不会实际启动.
   val shuffleService = new StandaloneWorkerShuffleService(conf, securityMgr)
 
   val publicAddress = {
@@ -163,6 +168,8 @@ private[spark] class Worker(
 
     metricsSystem.registerSource(workerSource)
     metricsSystem.start()
+    // Attach the worker metrics servlet handler to the web ui after the metrics system is started.
+    metricsSystem.getServletHandlers.foreach(webUi.attachHandler)
   }
 
   def changeMaster(url: String, uiUrl: String) {
@@ -177,6 +184,7 @@ private[spark] class Worker(
     }
     connected = true
     // Cancel any outstanding re-registration attempts because we found a new master
+    // 因为我们发现了一个新的master取消任何未处理的重注册attempts
     registrationRetryTimer.foreach(_.cancel())
     registrationRetryTimer = None
   }
@@ -193,6 +201,8 @@ private[spark] class Worker(
    * Re-register with the master because a network failure or a master failure has occurred.
    * If the re-registration attempt threshold is exceeded, the worker exits with error.
    * Note that for thread-safety this should only be called from the actor.
+   * 由于网络失败或者Master的失败导致的Worker重新向Master的注册。如果重新注册尝试测试超过门限值，则
+   * 认为Worker自身存在问题。 注意: 为了保证线程的安全，该方法只能由Actor调用
    */
   private def reregisterWithMaster(): Unit = {
     Utils.tryOrExit {
@@ -221,6 +231,8 @@ private[spark] class Worker(
          * old master must have died because another master has taken over. Note that this is
          * still not safe if the old master recovers within this interval, but this is a much
          * less likely scenario.
+         * 详细背书了在竞争条件下，Worker的注册可能存在重复的情况及如何尽量减少， 但无法彻底杜绝。
+         * 这是V1.2在Worker注册方面改动较大的原因。
          */
         if (master != null) {
           master ! RegisterWorker(
@@ -292,7 +304,7 @@ private[spark] class Worker(
           val isAppStillRunning = executors.values.map(_.appId).contains(appIdFromDir)
           dir.isDirectory && !isAppStillRunning &&
           !Utils.doesDirectoryContainAnyNewFiles(dir, APP_DATA_RETENTION_SECS)
-        }.foreach { dir => 
+        }.foreach { dir =>
           logInfo(s"Removing directory: ${dir.getPath}")
           Utils.deleteRecursively(dir)
         }
@@ -337,8 +349,19 @@ private[spark] class Worker(
             throw new IOException("Failed to create directory " + executorDir)
           }
 
+          // Create local dirs for the executor. These are passed to the executor via the
+          // SPARK_LOCAL_DIRS environment variable, and deleted by the Worker when the
+          // application finishes.
+          val appLocalDirs = appDirectories.get(appId).getOrElse {
+            Utils.getOrCreateLocalRootDirs(conf).map { dir =>
+              Utils.createDirectory(dir).getAbsolutePath()
+            }.toSeq
+          }
+          appDirectories(appId) = appLocalDirs
+          //启动Worker上的ExecutorRunner
           val manager = new ExecutorRunner(appId, execId, appDesc, cores_, memory_,
-            self, workerId, host, sparkHome, executorDir, akkaUrl, conf, ExecutorState.LOADING)
+            self, workerId, host, sparkHome, executorDir, akkaUrl, conf, appLocalDirs,
+            ExecutorState.LOADING)
           executors(appId + "/" + execId) = manager
           manager.start()
           coresUsed += cores_
@@ -375,6 +398,7 @@ private[spark] class Worker(
               message.map(" message " + _).getOrElse("") +
               exitStatus.map(" exitStatus " + _).getOrElse(""))
         }
+        maybeCleanupApplication(appId)
       }
 
     case KillExecutor(masterUrl, appId, execId) =>
@@ -444,12 +468,28 @@ private[spark] class Worker(
     case ReregisterWithMaster =>
       reregisterWithMaster()
 
+    case ApplicationFinished(id) =>
+      finishedApps += id
+      maybeCleanupApplication(id)
   }
 
   private def masterDisconnected() {
     logError("Connection to master failed! Waiting for master to reconnect...")
     connected = false
     registerWithMaster()
+  }
+
+  private def maybeCleanupApplication(id: String): Unit = {
+    val shouldCleanup = finishedApps.contains(id) && !executors.values.exists(_.appId == id)
+    if (shouldCleanup) {
+      finishedApps -= id
+      appDirectories.remove(id).foreach { dirList =>
+        logInfo(s"Cleaning up local directories for application $id")
+        dirList.foreach { dir =>
+          Utils.deleteRecursively(new File(dir))
+        }
+      }
+    }
   }
 
   def generateWorkerId(): String = {

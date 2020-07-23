@@ -33,6 +33,9 @@ object SimpleAnalyzer extends Analyzer(EmptyCatalog, EmptyFunctionRegistry, true
  * Provides a logical query plan analyzer, which translates [[UnresolvedAttribute]]s and
  * [[UnresolvedRelation]]s into fully typed objects using information in a schema [[Catalog]] and
  * a [[FunctionRegistry]].
+ *
+ * 提供一个逻辑查询计划分析器，它使用一个 schema [[Catalog]] 和 一个 [[FunctionRegistry]]，
+ * 将 [[UnresolvedAttribute]]s 和 [[UnresolvedRelation]]s 解析成完类型的对象。
  */
 class Analyzer(catalog: Catalog, registry: FunctionRegistry, caseSensitive: Boolean)
   extends RuleExecutor[LogicalPlan] with HiveTypeCoercion {
@@ -136,11 +139,11 @@ class Analyzer(catalog: Catalog, registry: FunctionRegistry, caseSensitive: Bool
    */
   object ResolveRelations extends Rule[LogicalPlan] {
     def apply(plan: LogicalPlan): LogicalPlan = plan transform {
-      case i @ InsertIntoTable(UnresolvedRelation(databaseName, name, alias), _, _, _) =>
+      case i @ InsertIntoTable(UnresolvedRelation(tableIdentifier, alias), _, _, _) =>
         i.copy(
-          table = EliminateAnalysisOperators(catalog.lookupRelation(databaseName, name, alias)))
-      case UnresolvedRelation(databaseName, name, alias) =>
-        catalog.lookupRelation(databaseName, name, alias)
+          table = EliminateAnalysisOperators(catalog.lookupRelation(tableIdentifier, alias)))
+      case UnresolvedRelation(tableIdentifier, alias) =>
+        catalog.lookupRelation(tableIdentifier, alias)
     }
   }
 

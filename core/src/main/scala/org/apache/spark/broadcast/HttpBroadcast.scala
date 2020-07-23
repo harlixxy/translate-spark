@@ -35,6 +35,10 @@ import org.apache.spark.util.{MetadataCleaner, MetadataCleanerType, TimeStampedH
  * task) is deserialized in the executor, the broadcasted data is fetched from the driver
  * (through a HTTP server running at the driver) and stored in the BlockManager of the
  * executor to speed up future accesses.
+ *
+ * HttpBroadcast是使用HTTP server做为广播媒介，实现Broadcast的一种方式。HTTP broadcast变量（作为task
+ * 的一部分）最初是在Executor上反序列化，被广播的数据从Driver上获取下来（通过在Driver上运行的HTTP server），
+ * 并存储在Exexutor的BlockManager中，从而加速了后续的访问
  */
 private[spark] class HttpBroadcast[T: ClassTag](
     @transient var value_ : T, isLocal: Boolean, id: Long)
@@ -47,6 +51,11 @@ private[spark] class HttpBroadcast[T: ClassTag](
   /*
    * Broadcasted data is also stored in the BlockManager of the driver. The BlockManagerMaster
    * does not need to be told about this block as not only need to know about this data block.
+   * 被广播的数据同时也存储在Driver上的BlockManager。不必
+   */
+  /**
+   * add by yay(598775508) at 2015/1/11-21:14
+   * 将变量id和值放入blockManager，但并不通知master
    */
   HttpBroadcast.synchronized {
     SparkEnv.get.blockManager.putSingle(
@@ -54,6 +63,7 @@ private[spark] class HttpBroadcast[T: ClassTag](
   }
 
   if (!isLocal) {
+//    将对象值按照指定的压缩、序列化写入指定的文件
     HttpBroadcast.write(id, value_)
   }
 
@@ -81,6 +91,7 @@ private[spark] class HttpBroadcast[T: ClassTag](
   private def readObject(in: ObjectInputStream): Unit = Utils.tryOrIOException {
     in.defaultReadObject()
     HttpBroadcast.synchronized {
+//      首先查看blockManager中是否已有，如有则直接取值，否则调用伴生对象的read方法进行读取
       SparkEnv.get.blockManager.getSingle(blockId) match {
         case Some(x) => value_ = x.asInstanceOf[T]
         case None => {
@@ -91,6 +102,9 @@ private[spark] class HttpBroadcast[T: ClassTag](
            * We cache broadcast data in the BlockManager so that subsequent tasks using it
            * do not need to re-fetch. This data is only used locally and no other node
            * needs to fetch this block, so we don't notify the master.
+           */
+          /**
+           * 我们缓存广播变量的值到BlockManager以便后续的任务可以直接使用而不需要重新获取.因为这些数据仅仅在本地使用，并且其他的node不需要获取这个block，所以我们不用通知Master
            */
           SparkEnv.get.blockManager.putSingle(
             blockId, value_, StorageLevel.MEMORY_AND_DISK, tellMaster = false)
@@ -124,10 +138,12 @@ private[broadcast] object HttpBroadcast extends Logging {
         compress = conf.getBoolean("spark.broadcast.compress", true)
         securityManager = securityMgr
         if (isDriver) {
+//          根据conf在driver创建一个httpServer(封装了jetty)，并启动
           createServer(conf)
           conf.set("spark.httpBroadcast.uri",  serverUri)
         }
         serverUri = conf.get("spark.httpBroadcast.uri")
+//        创建一个对象，定时清理过时的元数据
         cleaner = new MetadataCleaner(MetadataCleanerType.HTTP_BROADCAST, cleanup, conf)
         compressionCodec = CompressionCodec.createCodec(conf)
         initialized = true
@@ -151,9 +167,11 @@ private[broadcast] object HttpBroadcast extends Logging {
   }
 
   private def createServer(conf: SparkConf) {
-    broadcastDir = Utils.createTempDir(Utils.getLocalDir(conf))
+//    首先创建一个存放广播变量的目录
+    broadcastDir = Utils.createTempDir(Utils.getLocalDir(conf), "broadcast")
     val broadcastPort = conf.getInt("spark.broadcast.port", 0)
-    server = new HttpServer(broadcastDir, securityManager, broadcastPort, "HTTP broadcast server")
+    server =
+      new HttpServer(conf, broadcastDir, securityManager, broadcastPort, "HTTP broadcast server")
     server.start()
     serverUri = server.uri
     logInfo("Broadcast server started at " + serverUri)
@@ -161,7 +179,13 @@ private[broadcast] object HttpBroadcast extends Logging {
 
   def getFile(id: Long) = new File(broadcastDir, BroadcastBlockId(id).name)
 
+  /**
+   * 将对象值按照指定的压缩、序列化写入指定的文件
+   * @param id
+   * @param value
+   */
   private def write(id: Long, value: Any) {
+//    这个文件所在的目录即是HttpServer的资源目录
     val file = getFile(id)
     val fileOutputStream = new FileOutputStream(file)
     try {
@@ -182,6 +206,13 @@ private[broadcast] object HttpBroadcast extends Logging {
     }
   }
 
+  /**
+   * 使用serverUri和block id对应的文件名直接开启一个HttpConnection将中心服务器上相应的数据取过来，
+   * 并使用配置的压缩和序列化机制进行解压和反序列化
+   * @param id
+   * @tparam T
+   * @return
+   */
   private def read[T: ClassTag](id: Long): T = {
     logDebug("broadcast read server: " +  serverUri + " id: broadcast-" + id)
     val url = serverUri + "/" + BroadcastBlockId(id).name
@@ -219,6 +250,8 @@ private[broadcast] object HttpBroadcast extends Logging {
    * Remove all persisted blocks associated with this HTTP broadcast on the executors.
    * If removeFromDriver is true, also remove these persisted blocks on the driver
    * and delete the associated broadcast file.
+   * 清除Exexutor上所有的与HTTP广播数据有关的持久化数据块。
+   * 如果removeFromDriver被设置为true，则同时清除Driver上的持久化数据块，删除相关的广播数据文件
    */
   def unpersist(id: Long, removeFromDriver: Boolean, blocking: Boolean) = synchronized {
     SparkEnv.get.blockManager.master.removeBroadcast(id, removeFromDriver, blocking)
@@ -232,6 +265,8 @@ private[broadcast] object HttpBroadcast extends Logging {
   /**
    * Periodically clean up old broadcasts by removing the associated map entries and
    * deleting the associated files.
+   *
+   * 定期清除过期的broadcast数据，移除相关的映射数据，删除相关的数据文件
    */
   private def cleanup(cleanupTime: Long) {
     val iterator = files.internalMap.entrySet().iterator()
